@@ -166,6 +166,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         self._sent_cards: Dict[str, Dict[str, Any]] = {}
         self._card_closed_title = _setting("card_closed_title", env="WECOM_CARD_CLOSED_TITLE", default="已处理") or "已处理"
         self._card_action_url = _setting("card_action_url", env="WECOM_CARD_ACTION_URL", default="https://work.weixin.qq.com") or "https://work.weixin.qq.com"
+        # Debug only: sending this text to the bot makes it reply with a template card.
+        self._debug_card_command = _setting("debug_card_command", env="WECOM_DEBUG_CARD_COMMAND", default="").strip()
 
     def _startup_failure(self, code: str, message: str, log_msg: str, *args: Any) -> bool:
         self._set_fatal_error(code, message, retryable=True)
@@ -461,6 +463,11 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         text, reply_text = self._extract_text(body)
         if is_group and text:
             text = re.sub(r"^@\S+\s*", "", text).strip()  # "@Bot /approve" -> "/approve"
+        # Debug hook: lets a human verify the card round trip on the live connection
+        # without Odoo in the loop. Disabled unless WECOM_DEBUG_CARD_COMMAND is set.
+        if self._debug_card_command and text.strip() == self._debug_card_command:
+            await self._send_debug_card(chat_id)
+            return
         media_urls, media_types = await self._extract_media(body)
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
@@ -517,6 +524,30 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         body = {"chatid": chat_id, "chat_type": 1, "msgtype": "template_card", "template_card": card}
         return await self._enqueue_chat_send(
             chat_id, lambda: self._send_request(APP_CMD_SEND, body))
+
+    async def _send_debug_card(self, chat_id: str) -> None:
+        """Reply with a throwaway template card (debug trigger only)."""
+        task_id = "wecom-debug-" + uuid.uuid4().hex[:8]
+        card = {
+            "card_type": "button_interaction",
+            "task_id": task_id,
+            "source": {"desc": "Hermes", "desc_color": 0},
+            "main_title": {"title": "【插件自测】%s" % task_id, "desc": "点任一按钮后卡片应变灰"},
+            "sub_title_text": "这条卡片由网关的 wecom 插件直接发出，不经过 Odoo。",
+            "horizontal_content_list": [
+                {"keyname": "task_id", "value": task_id},
+                {"keyname": "来源", "value": self.name},
+            ],
+            "button_list": [
+                {"text": "同意", "style": 1, "key": "debug_approve"},
+                {"text": "拒绝", "style": 2, "key": "debug_reject"},
+            ],
+        }
+        try:
+            await self.send_template_card(chat_id, card)
+            logger.info("[%s] Debug card sent: task_id=%s chat=%s", self.name, task_id, chat_id)
+        except Exception:  # noqa: BLE001 - a failed probe must not kill the read loop
+            logger.exception("[%s] Debug card failed (task_id=%s)", self.name, task_id)
 
     async def _on_event_callback(self, payload: Dict[str, Any]) -> None:
         body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
