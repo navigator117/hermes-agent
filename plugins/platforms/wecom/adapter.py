@@ -365,7 +365,10 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
                 logger.warning("[%s] Kicked by server (another WS connection established). Suppressing reconnect to avoid mutual kicking. Check for duplicate gateway instances.", self.name)
                 self._running = False
             else:
-                await self._on_event_callback(payload)
+                # Never await request/response work here: _dispatch_payload runs on the
+                # websocket read loop, so a reply we wait for could only be read after
+                # this returns. The card close-out and its consumers go to their own task.
+                self._spawn_detached(self._on_event_callback(payload))
         elif cmd != APP_CMD_PING:
             logger.info("[%s] Unrouted websocket payload dropped: cmd=%r req_id=%s body_keys=%s", self.name, cmd or "(empty)", req_id or "(none)", list(body_dict.keys()) if body_dict is not None else None)
 
@@ -466,7 +469,7 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         # Debug hook: lets a human verify the card round trip on the live connection
         # without Odoo in the loop. Disabled unless WECOM_DEBUG_CARD_COMMAND is set.
         if self._debug_card_command and text.strip() == self._debug_card_command:
-            await self._send_debug_card(chat_id)
+            self._spawn_detached(self._send_debug_card(chat_id))
             return
         media_urls, media_types = await self._extract_media(body)
         message_type = self._derive_message_type(body, text, media_types)
@@ -492,6 +495,18 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             await self.handle_message(event)
 
     # -- template cards -------------------------------------------------------
+
+    @staticmethod
+    def _spawn_detached(coro: Any) -> None:
+        """Run ``coro`` as its own task so the websocket read loop keeps reading.
+
+        Anything that awaits a request/response must not be awaited from
+        ``_dispatch_payload``: the reply can only be read by that same loop.
+        """
+        try:
+            asyncio.create_task(coro)
+        except RuntimeError:  # no running loop (unit tests)
+            coro.close()
 
     def add_card_event_handler(self, handler: Callable[[Dict[str, Any]], Any]) -> None:
         """Register a callback for template-card clicks (sync or coroutine).
