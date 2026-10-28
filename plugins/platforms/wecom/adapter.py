@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from pm import install_hint
 import asyncio
+import inspect
 import json
 import logging
 import re
 import time
 import uuid
 from datetime import datetime, timezone, UTC
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     import aiohttp
@@ -53,11 +54,17 @@ APP_CMD_CALLBACK = "aibot_msg_callback"
 APP_CMD_LEGACY_CALLBACK = "aibot_callback"
 APP_CMD_EVENT_CALLBACK = "aibot_event_callback"
 APP_CMD_PING = "ping"
+# Only valid right after a template_card_event: WeCom rejects it outside that window.
+APP_CMD_UPDATE_CARD = "aibot_respond_update_msg"
+# WeCom accepts the card update for 5s after the click; stay well inside it.
+CARD_UPDATE_TIMEOUT_SECONDS = 4.0
 
 CALLBACK_COMMANDS = {APP_CMD_CALLBACK, APP_CMD_LEGACY_CALLBACK}
 NON_RESPONSE_COMMANDS = CALLBACK_COMMANDS | {APP_CMD_EVENT_CALLBACK}
 
 MAX_MESSAGE_LENGTH = 4000
+# Sent template cards kept around to render a meaningful "closed" card on click.
+MAX_CACHED_CARDS = 200
 CONNECT_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
@@ -152,6 +159,13 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
         self._stream_expired_chats, self._group_chat_ids = set(), set()  # groups can't receive proactive APP_CMD_SEND
         # Per-chat FIFO send queues (normal + control lanes) + token buckets — see send_queue.py.
         self._chat_queues, self._chat_workers, self._control_queues, self._control_workers, self._chat_token_usage = {}, {}, {}, {}, {}
+        # Template card clicks. The adapter stays ignorant of what a card means: it closes
+        # the card out (WeCom only accepts that within 5s of the click) and forwards the
+        # raw payload to handlers other plugins registered.
+        self._card_event_handlers: List[Callable[[Dict[str, Any]], Any]] = []
+        self._sent_cards: Dict[str, Dict[str, Any]] = {}
+        self._card_closed_title = _setting("card_closed_title", env="WECOM_CARD_CLOSED_TITLE", default="已处理") or "已处理"
+        self._card_action_url = _setting("card_action_url", env="WECOM_CARD_ACTION_URL", default="https://work.weixin.qq.com") or "https://work.weixin.qq.com"
 
     def _startup_failure(self, code: str, message: str, log_msg: str, *args: Any) -> bool:
         self._set_fatal_error(code, message, retryable=True)
@@ -348,6 +362,8 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             if str((payload.get("body") or {}).get("event_type") or "") == "disconnected_event":
                 logger.warning("[%s] Kicked by server (another WS connection established). Suppressing reconnect to avoid mutual kicking. Check for duplicate gateway instances.", self.name)
                 self._running = False
+            else:
+                await self._on_event_callback(payload)
         elif cmd != APP_CMD_PING:
             logger.info("[%s] Unrouted websocket payload dropped: cmd=%r req_id=%s body_keys=%s", self.name, cmd or "(empty)", req_id or "(none)", list(body_dict.keys()) if body_dict is not None else None)
 
@@ -467,6 +483,91 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
+
+    # -- template cards -------------------------------------------------------
+
+    def add_card_event_handler(self, handler: Callable[[Dict[str, Any]], Any]) -> None:
+        """Register a callback for template-card clicks (sync or coroutine).
+
+        The handler receives the raw ``aibot_event_callback`` payload and runs *after*
+        the card has already been closed out, so it may take its time (call Odoo, run
+        an agent turn, ...) without racing WeCom's 5s update window.
+        """
+        if callable(handler) and handler not in self._card_event_handlers:
+            self._card_event_handlers.append(handler)
+
+    async def send_template_card(self, chat_id: str, card: Dict[str, Any], reply_to: Optional[str] = None) -> Dict[str, Any]:
+        """Send one template card to a DM (``chat_id`` is the member's userid).
+
+        Cards must leave from *this* connection: WeCom delivers the button event back to
+        whoever sent the card, and ``aibot_respond_update_msg`` only works on that same
+        connection. ``card["task_id"]`` is required - it is echoed back on the click and
+        is the only way to tell which card was pressed.
+        """
+        if not chat_id:
+            raise ValueError("chat_id is required")
+        task_id = str(card.get("task_id") or "").strip()
+        if not task_id:
+            raise ValueError('template_card needs a "task_id"')
+        # Keep the card so _close_template_card can echo its title; bounded so a long
+        # running gateway does not grow this without limit.
+        self._sent_cards[task_id] = card
+        while len(self._sent_cards) > MAX_CACHED_CARDS:
+            self._sent_cards.pop(next(iter(self._sent_cards)))
+        body = {"chatid": chat_id, "chat_type": 1, "msgtype": "template_card", "template_card": card}
+        return await self._enqueue_chat_send(
+            chat_id, lambda: self._send_request(APP_CMD_SEND, body))
+
+    async def _on_event_callback(self, payload: Dict[str, Any]) -> None:
+        body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+        event = body.get("event") if isinstance(body.get("event"), dict) else {}
+        if str(event.get("eventtype") or "").lower() != "template_card_event":
+            logger.debug("[%s] Ignoring event callback %r", self.name, event.get("eventtype"))
+            return
+        detail = event.get("template_card_event") if isinstance(event.get("template_card_event"), dict) else {}
+        logger.info("[%s] Card event: key=%r task_id=%r from=%r", self.name,
+                    detail.get("event_key"), detail.get("task_id"),
+                    (body.get("from") or {}).get("userid"))
+        try:
+            await self._close_template_card(self._payload_req_id(payload), detail)
+        except Exception as exc:  # noqa: BLE001 - the click still has to reach the handler
+            logger.warning("[%s] Could not close template card %r: %s",
+                           self.name, detail.get("task_id"), exc)
+        for handler in list(self._card_event_handlers):
+            try:
+                result = handler(payload)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # noqa: BLE001 - one bad consumer must not drop the others
+                logger.exception("[%s] Card event handler raised", self.name)
+
+    async def _close_template_card(self, reply_req_id: str, detail: Dict[str, Any]) -> None:
+        """Replace the clicked card with a read-only notice.
+
+        ``task_id`` has to repeat the original one or WeCom answers 40058; the request
+        also has to land within 5s of the click, which is why it runs before the
+        downstream handlers rather than after them.
+        """
+        if not reply_req_id:
+            raise ValueError("card event without req_id")
+        task_id = str(detail.get("task_id") or "")
+        original = self._sent_cards.pop(task_id, None) or {}
+        original_title = ((original.get("main_title") or {}).get("title") or "").strip()
+        card = {
+            "card_type": "text_notice",
+            "task_id": task_id,
+            "source": {"desc": "Hermes", "desc_color": 0},
+            "main_title": {
+                "title": original_title or self._card_closed_title,
+                "desc": self._card_closed_title,
+            },
+            "sub_title_text": str(detail.get("event_key") or ""),
+            "card_action": {"type": 1, "url": self._card_action_url},
+        }
+        await self._request(APP_CMD_UPDATE_CARD, reply_req_id, {
+            "response_type": "update_template_card",
+            "template_card": card,
+        }, timeout=CARD_UPDATE_TIMEOUT_SECONDS)
 
     def _admit_inbound(self, is_group: bool, chat_id: str, sender_id: str) -> bool:
         """Apply group_policy / dm_policy at intake; logs and returns False when dropped."""
